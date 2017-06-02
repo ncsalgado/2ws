@@ -1,25 +1,23 @@
 package main
 /*
 TODOs:
-4. Test tar.gz:
+1. Test tar.gz:
    1. Empty dirs to create
    2. Removed dirs to create
    3. File created inside dir with 2 level deep
    4. Create Files with spaces in root and in subdirs 
    5. Create Files with \t and \n in root and in subdirs
-5. Implement Events
-6. Create Config Option to Create Local and Replica Backups
-7. Execute step by step Local, Replica and Remote Replica
-8. Execute rsync to Replica and Remote Replica
-9. Execute rsync to Local
-10. Update IUL and IUR
-11. Always running to detect Local and Local Replica chnages
-12. Detect Replica changes
-13. Sync by http
+2. Implement Events
+3. Create Config Option to Create Local and Replica Backups
+4. Update IUL and IUR base on IAL and IAR
+5. Always running to detect Local and Local Replica chnages
+6. Detect Replica changes
+7. Sync by http
 
 */
 import (
 	"bufio"
+//	"bytes"
 	"hash/crc32"
 	"encoding/hex"
 	"flag"
@@ -58,9 +56,12 @@ type configConSyncTp struct {
 	_IARFilePath   string
 	_DIRFilePath   string
 	_CARFilePath   string
-	_RSLFilePath   string
-	_RSRFilePath   string
+	_RSLFilePath   string // Files/Folders from Local to Replica
+	_RSRFilePath   string // Files/Folders from Replica to Local
 	_LocalBakRoot  string
+	_DIRReplicaFilePath string
+	_CARReplicaFilePath string
+	_RSLReplicaFilePath string
 	_ReplicaBakRoot string
 	_FirstTime     bool
 	SyncSubfolders string
@@ -73,17 +74,24 @@ type configConSyncTp struct {
 
 type configConTp struct {
 	_ParentConfig  *configTp
-	ReplicaConnection                   string
+	_ReplicaUserDir string
+	_ReplicaWorkDirPath string
+	_ReplicaAppFilePath string
+	_ReplicaConfigFilePath string
+	_ReplicaHomeDirPath string
+	_ReplicaUserHost string
+	ReplicaConnection string
 	NetworkConnectionsToReplicaList     []string
 	NetworkConnectionsAllowedDisallowed string
-	SyncsList                           []configConSyncTp
+	SyncsList []configConSyncTp
 }
 
 type configLstConTp []configConTp
 
 type configTp struct {
 	_TimeStamp      string
-	_WorkFolderPath  string
+	_WorkDirPath string
+	_HomeDirPath string
 	ConnectionsList configLstConTp
 }
 
@@ -114,26 +122,29 @@ http://www.mrwaggel.be/post/generate-crc32-hash-of-a-file-in-go/
 	return returnCRC32String
 }
 
-func readConfig() (vConfigDef configTp) {
+func readConfig(iConfigFilePath string) (vConfigDef configTp) {
 	vConfig := viper.New()
 	vConfig.SetConfigType("hcl")
 	vConfig.SetConfigName(cAppName)             // name of config file (without extension)
-	vConfig.AddConfigPath("$HOME/." + cAppName) // call multiple times to add many search paths
-	vConfig.AddConfigPath(".")                  // optionally look for config in the working directory
+	if iConfigFilePath != "" {
+		vConfig.AddConfigPath(iConfigFilePath) // call multiple times to add many search paths
+	} else {
+		vConfig.AddConfigPath("$HOME/." + cAppName) // call multiple times to add many search paths
+		vConfig.AddConfigPath(".")                  // optionally look for config in the working directory
+	}
 	// Read Config File
 	err := vConfig.ReadInConfig()
 	CheckErrorPanic(err, fmt.Sprintf("Reading config file %s", cAppName))
 	// Parse Config File
 	err = vConfig.Unmarshal(&vConfigDef)
 	CheckErrorPanic(err, fmt.Sprintf("Decoding into struct"))
-	// Working folder $HOME
-	var vHomeDir string
+	// Working folder no local $HOME
 	if usr, err := user.Current(); err != nil {
-		vHomeDir = "."
+		vConfigDef._HomeDirPath = "."
 	} else {
-		vHomeDir = usr.HomeDir
+		vConfigDef._HomeDirPath = usr.HomeDir
 	}
-	vConfigDef._WorkFolderPath = filepath.Join(vHomeDir, "."+cAppName)
+	vConfigDef._WorkDirPath = filepath.Join(vConfigDef._HomeDirPath, "."+cAppName)
 	// Name for backup folder
 	vConfigDef._TimeStamp = fmt.Sprint(time.Now().UTC().UnixNano())
 	// Create Connections Id's and full file's path for each sync
@@ -141,6 +152,29 @@ func readConfig() (vConfigDef configTp) {
 	for iC := 0; iC < len(vConfigDef.ConnectionsList); iC++ {
 		// Store parent
 		vConfigDef.ConnectionsList[iC]._ParentConfig = &vConfigDef
+
+		if (vConfigDef.ConnectionsList[iC].ReplicaConnection == "") {
+			vConfigDef.ConnectionsList[iC]._ReplicaWorkDirPath = vConfigDef._WorkDirPath
+		} else {
+			// Extract User@Host (vUserHost) and Host "Home" Dir (vHostPath)
+			var vPosColon int
+			var vUserHost, vHostPath string
+
+			vPosColon = strings.Index(vConfigDef.ConnectionsList[iC].ReplicaConnection, ":")
+			if vPosColon == -1 {
+				vUserHost = vConfigDef.ConnectionsList[iC].ReplicaConnection
+				vHostPath = "~"
+			} else {
+				vUserHost = vConfigDef.ConnectionsList[iC].ReplicaConnection[:vPosColon]
+				vHostPath = vConfigDef.ConnectionsList[iC].ReplicaConnection[vPosColon+1:]
+			}
+			// Set Replica working dir
+			vConfigDef.ConnectionsList[iC]._ReplicaUserHost = vUserHost
+			vConfigDef.ConnectionsList[iC]._ReplicaHomeDirPath = vHostPath
+			vConfigDef.ConnectionsList[iC]._ReplicaWorkDirPath = filepath.Join(vHostPath, "."+cAppName)
+			vConfigDef.ConnectionsList[iC]._ReplicaAppFilePath = filepath.Join(vHostPath, cAppName)
+			vConfigDef.ConnectionsList[iC]._ReplicaConfigFilePath = filepath.Join(vConfigDef.ConnectionsList[iC]._ReplicaWorkDirPath, cAppName+".hcl")
+		}
 		for iCS := 0; iCS < len(vConfigDef.ConnectionsList[iC].SyncsList); iCS++ {
 			// Simplify left side
 			vConSync := &vConfigDef.ConnectionsList[iC].SyncsList[iCS]
@@ -148,29 +182,33 @@ func readConfig() (vConfigDef configTp) {
 			vConSync._ParentConfigCon = &vConfigDef.ConnectionsList[iC]
 			// To track changes, Hash name of Connection + ReplicaRoot + LocalRoot
 			vConSync._Id = fmt.Sprintf("%08x", crc32.Checksum([]byte(vConfigDef.ConnectionsList[iC].ReplicaConnection + vConSync.ReplicaRoot + vConSync.LocalRoot), crc32q))
-			if err := os.Mkdir(filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id), 0755); ! os.IsExist(err) {
+			if err := os.Mkdir(filepath.Join(vConfigDef._WorkDirPath, vConSync._Id), 0755); ! os.IsExist(err) {
 				CheckErrorPanic(err, fmt.Sprintf("Creating working dir %s", vConSync._Id))
 			}
 			// Se Deu erro->Pasta não existia por isso 1ª vez 
 			vConSync._FirstTime = err != nil
 			// Backup folder
-			//err := os.Mkdir(filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, vConfigDef._TimeStamp), 0755)
-			//CheckErrorPanic(err, fmt.Sprintf("Creating backup dir %s", filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, vConfigDef._TimeStamp)))
+			//err := os.Mkdir(filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, vConfigDef._TimeStamp), 0755)
+			//CheckErrorPanic(err, fmt.Sprintf("Creating backup dir %s", filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, vConfigDef._TimeStamp)))
 
-			vConSync._LocalBakRoot =   filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, vConfigDef._TimeStamp)
-			vConSync._ReplicaBakRoot = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, vConfigDef._TimeStamp + "R")
+			vConSync._LocalBakRoot =   filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, vConfigDef._TimeStamp)
+			vConSync._ReplicaBakRoot = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, vConfigDef._TimeStamp + "R")
 
-			vConSync._IULFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "iul.txt")
-			vConSync._IURFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "iur.txt")
-			vConSync._IARFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "iar.txt")
-			vConSync._IALFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "ial.txt")
-			vConSync._DILFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "dil.txt")
-			vConSync._DIRFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "dir.txt")
-			vConSync._CALFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "cal.sh")
-			vConSync._CARFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "car.sh")
-			vConSync._RSLFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "rsl.txt")
-			vConSync._RSRFilePath = filepath.Join(vConfigDef._WorkFolderPath, vConSync._Id, "rsr.txt")
-		}
+			vConSync._IULFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "iul.txt")
+			vConSync._IURFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "iur.txt")
+			vConSync._IARFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "iar.txt")
+			vConSync._IALFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "ial.txt")
+			vConSync._DILFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "dil.txt")
+			vConSync._DIRFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "dir.txt")
+			vConSync._DIRReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "dir.txt")
+			vConSync._CALFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "cal.sh")
+			vConSync._CARFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "car.sh")
+			vConSync._CARReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "car.sh")
+			vConSync._RSLFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "rsl.txt")
+			vConSync._RSLReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "rsl.txt")
+			vConSync._RSRFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "rsr.txt")
+			
+		}//for iCS
 	}
 	return
 }
@@ -494,7 +532,7 @@ func DiffDILandDIR(iConfigCon configConSyncTp){
 						vLineSplitdiL[cIdxGid], vLineSplitdiL[cIdxUid], vFileNamePathR))
 				case (vStatusFileL == "N"):
 					// Local as new or different Dir => Backup Replica; Copy Local to Replica
-					vFcaR.WriteString(fmt.Sprintf("mkdir %s\n", vFileNamePathR))
+					vFcaR.WriteString(fmt.Sprintf("mkdir \"%s\"\n", vFileNamePathR))
 				case (vStatusFileL == "D"):
 					// Local deleted file => Backup Replica; Delete Replica
 					vLstDelDirR = append(vLstDelDirR, fmt.Sprintf("rmdir \"%s\"\n", vFileNamePathR))
@@ -540,7 +578,7 @@ func DiffDILandDIR(iConfigCon configConSyncTp){
 						vLineSplitdiR[cIdxGid], vLineSplitdiR[cIdxUid], vFileNamePathL))
 				case (vStatusFileR == "N"):
 					// Local as new or different Dir => Backup Replica; Copy Local to Replica
-					vFcaL.WriteString(fmt.Sprintf("mkdir %s\n", vFileNamePathL))
+					vFcaL.WriteString(fmt.Sprintf("mkdir \"%s\"\n", vFileNamePathL))
 				case (vStatusFileR == "D"):
 					// Local deleted file => Backup Replica; Delete Replica
 					vLstDelDirL = append(vLstDelDirL, fmt.Sprintf("rmdir \"%s\"\n", vFileNamePathL))
@@ -580,17 +618,6 @@ func DiffDILandDIR(iConfigCon configConSyncTp){
 	for i:=len(vLstDelDirR)-1; i>=0; i-- {
 		vFcaR.WriteString(vLstDelDirR[i])
 	}
-
-	vR, _ := vFrsR.Stat()
-	if vR.Size() > 0 {
-		vFcaL.WriteString(fmt.Sprintf("rsync -v --files-from=\"%s\" -R %s\"%s\"   \"%s\"\n",
-			iConfigCon._RSRFilePath, iConfigCon._ParentConfigCon.ReplicaConnection, iConfigCon.ReplicaRoot, iConfigCon.LocalRoot))
-	}
-	vR, _ = vFrsL.Stat()
-	if vR.Size() > 0 {
-		vFcaL.WriteString(fmt.Sprintf("rsync -v --files-from=\"%s\" -R   \"%s\" %s\"%s\"\n",
-			iConfigCon._RSLFilePath, iConfigCon.LocalRoot, iConfigCon._ParentConfigCon.ReplicaConnection, iConfigCon.ReplicaRoot))
-	}
 }
 
 func ExecOsCmd(iCmd string, iLstArgs ...string) (err error) {
@@ -598,6 +625,7 @@ func ExecOsCmd(iCmd string, iLstArgs ...string) (err error) {
 //	cmd.Stdin = strings.NewReader("some input")
 //	var out bytes.Buffer
 //	cmd.Stdout = &out
+//	fmt.Printf("%s %s\n", iCmd, iLstArgs)
 	err = cmd.Run()
 	if err != nil {
 		CheckErrorPanic(err, fmt.Sprintf("executar comando %s(%s)", iCmd, iLstArgs))
@@ -605,60 +633,102 @@ func ExecOsCmd(iCmd string, iLstArgs ...string) (err error) {
 	return
 }
 
-func twows(){
-	vConfigDef := readConfig()
+func twows(iConfigFilePath, iReplicaConnectionToSync string){
+	vConfigDef := readConfig(iConfigFilePath)
 	for _, vConfCon := range vConfigDef.ConnectionsList {
-fmt.Println(vConfCon.ReplicaConnection)
-		for _, vConfConSync := range vConfCon.SyncsList {
-fmt.Println(vConfConSync._Id)
-			criaIAL(vConfConSync)
-			criaNovoSeNaoExisteIUL(vConfConSync)
-			fazDIL(vConfConSync)
-			if (vConfCon.ReplicaConnection == "") {
-				criaIAR(vConfConSync)
-				criaNovoSeNaoExisteIUR(vConfConSync)
-				fazDIR(vConfConSync)
-				DiffDILandDIR(vConfConSync)
-				ExecOsCmd("/bin/sh", vConfConSync._CARFilePath)
-				criaIUR(vConfConSync)
-				ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
-				criaIUL(vConfConSync)
-			} else {
-				ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
-			}
-		}
-	}
+		if (iReplicaConnectionToSync == "") || (vConfCon.ReplicaConnection == iReplicaConnectionToSync) {
+//fmt.Println(vConfCon.ReplicaConnection)
+			for _, vConfConSync := range vConfCon.SyncsList {
+//fmt.Println(vConfConSync._Id)
+				criaIAL(vConfConSync)
+				criaNovoSeNaoExisteIUL(vConfConSync)
+				fazDIL(vConfConSync)
+				if (vConfCon.ReplicaConnection == "") {
+					criaIAR(vConfConSync)
+					criaNovoSeNaoExisteIUR(vConfConSync)
+					fazDIR(vConfConSync)
+					DiffDILandDIR(vConfConSync)
+					ExecOsCmd("/bin/sh", vConfConSync._CARFilePath)
+					// Send files to Replica
+					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSLFilePath), "-R",
+						vConfConSync.LocalRoot, vConfConSync.ReplicaRoot)
+					criaIUR(vConfConSync)
+					ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
+					// Receive files from Replica
+					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSRFilePath), "-R",
+						vConfConSync.ReplicaRoot, vConfConSync.LocalRoot)
+					criaIUL(vConfConSync)
+				} else {
+/*
+TODO:
+cannot copy 2ws to replica because it could not be the same type of processor: //extrai o path para a aplicação
+gera o ficheiro config para o servidor
+*/
+					// Send Config File to Replica
+					ExecOsCmd("/usr/bin/rsync", cAppName+".hcl", vConfCon.ReplicaConnection)
+					// Create IAR on Replica
+					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o IAR", vConfCon._ReplicaAppFilePath, vConfCon.ReplicaConnection))
+					// Create DIR on Replica
+					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o DIR", vConfCon._ReplicaAppFilePath, vConfCon.ReplicaConnection))
+					// Get created DIR from Host to Local
+					ExecOsCmd("/usr/bin/rsync", vConfCon._ReplicaUserHost+":"+vConfConSync._DIRReplicaFilePath, vConfConSync._DIRFilePath)
+					// Analyse Differences
+					DiffDILandDIR(vConfConSync)
+					// Send CAR.sh to Replica
+					ExecOsCmd("/usr/bin/rsync", vConfConSync._CARFilePath, vConfCon._ReplicaUserHost+":"+vConfConSync._CARReplicaFilePath)
+					// Exec remote CAR.sh
+					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("/bin/sh %s", vConfConSync._CARReplicaFilePath))
+					// Send files to Replica
+					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSLFilePath), "-R",
+						vConfConSync.LocalRoot, vConfCon._ReplicaUserHost+":"+vConfConSync.ReplicaRoot)
+					// Create IUR on Host
+					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o IUR", vConfCon._ReplicaAppFilePath, vConfCon.ReplicaConnection))
+					// Exec CAL.sh
+					ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
+					// Receive files from Replica
+					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSRFilePath), "-R",
+						vConfCon._ReplicaUserHost+":"+vConfConSync.ReplicaRoot, vConfConSync.LocalRoot)
+					// Create IUL
+					criaIUL(vConfConSync)
+				}
+			}//for
+		}//if vConfCon.ReplicaConnection == iReplicaConnectionToSync
+	}//for
 }
 
 
 func main() {
-	var vOp string
-    flag.StringVar(&vOp, "op", "", "Options available: IAL, DIL, IAR, DIR, DIF, IUL, IUR")
+	var vOp, vConfigFilePath, vReplicaConnectionToSync string
+    flag.StringVar(&vOp, "o", "", "Options available: IAL, DIL, IAR, DIR, DIF, IUL, IUR")
+    flag.StringVar(&vConfigFilePath, "c", "", "Config file path")
+    flag.StringVar(&vReplicaConnectionToSync, "r", "", "Replica connection to sync")
 
 	flag.Parse()
 	
 	if vOp == "" {
-		twows()
+		twows(vConfigFilePath, vReplicaConnectionToSync)
 	} else {
-		vConfigDef := readConfig()
+		vConfigDef := readConfig(vConfigFilePath)
 		for _, vConfCon := range vConfigDef.ConnectionsList {
-			for _, vConfConSync := range vConfCon.SyncsList {
-				switch vOp{
-				case "IAL": criaIAL(vConfConSync)
-				case "DIL":
-					criaNovoSeNaoExisteIUL(vConfConSync)
-					fazDIL(vConfConSync)
-				case "IAR": criaIAR(vConfConSync)
-					criaNovoSeNaoExisteIUR(vConfConSync)
-					fazDIR(vConfConSync)
-				case "DIR": fazDIR(vConfConSync)
-				case "DIF": DiffDILandDIR(vConfConSync)
-				case "CAR": ExecOsCmd("/bin/sh", vConfConSync._CARFilePath)
-				case "CAL": ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
-				case "IUL": criaIUL(vConfConSync)
-				case "IUR": criaIUR(vConfConSync)
-				}//switch
-			}//for
+			if (vReplicaConnectionToSync == "") || (vConfCon.ReplicaConnection == vReplicaConnectionToSync) {
+				for _, vConfConSync := range vConfCon.SyncsList {
+					switch vOp{
+					case "IAL": criaIAL(vConfConSync)
+					case "DIL":
+						criaNovoSeNaoExisteIUL(vConfConSync)
+						fazDIL(vConfConSync)
+					case "IAR": criaIAR(vConfConSync)
+					case "DIR":
+						criaNovoSeNaoExisteIUR(vConfConSync)
+						fazDIR(vConfConSync)
+					case "DIF": DiffDILandDIR(vConfConSync)
+					case "CAR": ExecOsCmd("/bin/sh", vConfConSync._CARFilePath)
+					case "CAL": ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
+					case "IUL": criaIUL(vConfConSync)
+					case "IUR": criaIUR(vConfConSync)
+					}//switch
+				}//for
+			}//if vConfCon.ReplicaConnection == vReplicaConnectionToSync
 		}//for
 	}
 }
