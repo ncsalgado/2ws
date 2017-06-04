@@ -692,13 +692,13 @@ gera o ficheiro config para o servidor
 					ExecOsCmd("/usr/bin/rsync", vConfConSync._CARFilePath, vConfCon._ReplicaUserHost+":"+vConfConSync._CARReplicaFilePath)
 					// Exec remote CAR.sh
 					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("/bin/sh %s", vConfConSync._CARReplicaFilePath))
+					// Exec CAL.sh (Before sending files to Replica because renaming file in conflict)
+					ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
 					// Send files to Replica
 					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSLFilePath), "-R",
 						vConfConSync.LocalRoot, vConfCon._ReplicaUserHost+":"+vConfConSync.ReplicaRoot)
 					// Create IUR on Host
 					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o IUR", vConfCon._ReplicaAppFilePath, vConfCon.ReplicaConnection))
-					// Exec CAL.sh
-					ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
 					// Receive files from Replica
 					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSRFilePath), "-R",
 						vConfCon._ReplicaUserHost+":"+vConfConSync.ReplicaRoot, vConfConSync.LocalRoot)
