@@ -73,9 +73,11 @@ type configConSyncTp struct {
 	_RSLFilePath   string // Files/Folders from Local to Replica
 	_RSRFilePath   string // Files/Folders from Replica to Local
 	_LocalBakRoot  string
-	_DIRReplicaFilePath string
+	_DILReplicaFilePath string
+	_CALReplicaFilePath string
 	_CARReplicaFilePath string
 	_RSLReplicaFilePath string
+	_RSRReplicaFilePath string
 	_ReplicaBakRoot string
 	_FirstTime     bool
 	SyncSubfolders string
@@ -106,9 +108,9 @@ type configTp struct {
 	_TimeStamp      string
 	_WorkDirPath string
 	_HomeDirPath string
+	_LogFilePath string
 	ConnectionsList configLstConTp
 }
-
 
 func CheckErrorPanic(iErr error, iMsgErr string){
 	if iErr != nil { // Handle errors
@@ -161,6 +163,8 @@ func readConfig(iConfigFilePath string) (vConfigDef configTp) {
 	vConfigDef._WorkDirPath = filepath.Join(vConfigDef._HomeDirPath, "."+cAppName)
 	// Name for backup folder
 	vConfigDef._TimeStamp = fmt.Sprint(time.Now().UTC().UnixNano())
+	// Log file name
+	vConfigDef._LogFilePath = filepath.Join(vConfigDef._WorkDirPath, "Log.txt")
 	// Create Connections Id's and full file's path for each sync
 	crc32q := crc32.MakeTable(0xD5828281)
 	for iC := 0; iC < len(vConfigDef.ConnectionsList); iC++ {
@@ -213,18 +217,26 @@ func readConfig(iConfigFilePath string) (vConfigDef configTp) {
 			vConSync._IARFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "iar.txt")
 			vConSync._IALFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "ial.txt")
 			vConSync._DILFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "dil.txt")
+			vConSync._DILReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "dil.txt")
 			vConSync._DIRFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "dir.txt")
-			vConSync._DIRReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "dir.txt")
 			vConSync._CALFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "cal.sh")
+			vConSync._CALReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "cal.sh")
 			vConSync._CARFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "car.sh")
 			vConSync._CARReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "car.sh")
 			vConSync._RSLFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "rsl.txt")
 			vConSync._RSLReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "rsl.txt")
 			vConSync._RSRFilePath = filepath.Join(vConfigDef._WorkDirPath, vConSync._Id, "rsr.txt")
+			vConSync._RSRReplicaFilePath = filepath.Join(vConSync._ParentConfigCon._ReplicaWorkDirPath, vConSync._Id, "rsr.txt")
 			
 		}//for iCS
 	}
 	return
+}
+
+func LogToFile(iConfigCon configTp, iMsg string) {
+	vFp, err := os.OpenFile(iConfigCon._LogFilePath, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666); defer vFp.Close()
+	CheckErrorPanic(err, fmt.Sprintf("opening file: %s", iConfigCon._LogFilePath))
+	vFp.WriteString(fmt.Sprintf("%s: %s\n", time.Now().Format(time.RFC3339), iMsg))
 }
 
 func criaNovoSeNaoExisteIUL(iConfigCon configConSyncTp) {
@@ -244,10 +256,8 @@ func criaIUR(iConfigCon configConSyncTp) {
 }
 
 func criaIA_Local(iIA_LocalFilePath, iLocalRoot string, iLstPaths []string, iDoFileCRC bool) {
-	vFp, err := os.Create(iIA_LocalFilePath)
-	if err != nil {
-		fmt.Println("Could not open file: " + iIA_LocalFilePath)
-	}
+	vFp, err := os.Create(iIA_LocalFilePath); defer vFp.Close()
+	CheckErrorPanic(err, fmt.Sprintf("opening file: %s", iIA_LocalFilePath))
 	for _, vPath := range iLstPaths {
 		vInventoryPath := filepath.Join(iLocalRoot, vPath)
 		// Check paths
@@ -259,10 +269,11 @@ func criaIA_Local(iIA_LocalFilePath, iLocalRoot string, iLstPaths []string, iDoF
 				var vDirChar, vFileCRC string
 				if iInfo.IsDir() {
 					vDirChar = "/"
+					vFileCRC = "L"
 				} else {
 					vDirChar = ""
 					if iDoFileCRC{
-						vFileCRC = hash_file_crc32(iFilePath, 0)
+						vFileCRC = "R" //hash_file_crc32(iFilePath, 0)
 					}
 				}
 				vRelPath, _ := filepath.Rel(iLocalRoot, iFilePath)
@@ -282,7 +293,6 @@ func criaIA_Local(iIA_LocalFilePath, iLocalRoot string, iLstPaths []string, iDoF
 				return nil
 			})
 	}
-	vFp.Close()
 }
 
 func criaIAL(iConfigCon configConSyncTp) {
@@ -641,108 +651,126 @@ func ExecOsCmd(iCmd string, iLstArgs ...string) (err error) {
 //	cmd.Stdout = &out
 //	fmt.Printf("%s %s\n", iCmd, iLstArgs)
 	err = cmd.Run()
-	if err != nil {
-		CheckErrorPanic(err, fmt.Sprintf("executar comando %s(%s)", iCmd, iLstArgs))
-	}
+	CheckErrorPanic(err, fmt.Sprintf("executar comando %s(%s)", iCmd, iLstArgs))
 	return
 }
 
 func twows(iConfigFilePath, iReplicaConnectionToSync string){
 	vConfigDef := readConfig(iConfigFilePath)
+	LogToFile(vConfigDef, "Starting")
 	for _, vConfCon := range vConfigDef.ConnectionsList {
-		if (iReplicaConnectionToSync == "") || (vConfCon.ReplicaConnection == iReplicaConnectionToSync) {
-//fmt.Println(vConfCon.ReplicaConnection)
-			for _, vConfConSync := range vConfCon.SyncsList {
-//fmt.Println(vConfConSync._Id)
+		LogToFile(vConfigDef, fmt.Sprintf("Processing Connection %s", vConfCon.ReplicaConnection))
+		if (vConfCon.ReplicaConnection != "") {
+			// Send Config File to Replica
+			LogToFile(vConfigDef, fmt.Sprintf("    Sending Config to Remote Replica"))
+			ExecOsCmd("/usr/bin/rsync", cAppName+".hcl", vConfCon.ReplicaConnection)
+		}
+		for _, vConfConSync := range vConfCon.SyncsList {
+			if (iReplicaConnectionToSync == "") || (vConfConSync._Id == iReplicaConnectionToSync) {
+				LogToFile(vConfigDef, fmt.Sprintf("  Sync Id %s", vConfConSync._Id))
+				LogToFile(vConfigDef, fmt.Sprintf("    Making IAL"))
 				criaIAL(vConfConSync)
+				LogToFile(vConfigDef, fmt.Sprintf("    Making DIL"))
 				criaNovoSeNaoExisteIUL(vConfConSync)
 				fazDIL(vConfConSync)
 				if (vConfCon.ReplicaConnection == "") {
+					LogToFile(vConfigDef, fmt.Sprintf("    Making IAR"))
 					criaIAR(vConfConSync)
+					LogToFile(vConfigDef, fmt.Sprintf("    Making DIR"))
 					criaNovoSeNaoExisteIUR(vConfConSync)
 					fazDIR(vConfConSync)
+					LogToFile(vConfigDef, fmt.Sprintf("    Making diffs"))
 					DiffDILandDIR(vConfConSync)
+					LogToFile(vConfigDef, fmt.Sprintf("    Executing CAR"))
 					ExecOsCmd("/bin/sh", vConfConSync._CARFilePath)
 					// Send files to Replica
+					LogToFile(vConfigDef, fmt.Sprintf("    Sending files to Replica"))
 					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSLFilePath), "-R",
 						vConfConSync.LocalRoot, vConfConSync.ReplicaRoot)
+					LogToFile(vConfigDef, fmt.Sprintf("    Making IUR"))
 					criaIUR(vConfConSync)
+					LogToFile(vConfigDef, fmt.Sprintf("    Executing CAL"))
 					ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
 					// Receive files from Replica
+					LogToFile(vConfigDef, fmt.Sprintf("    Receiving files from Replica"))
 					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSRFilePath), "-R",
 						vConfConSync.ReplicaRoot, vConfConSync.LocalRoot)
-					criaIUL(vConfConSync)
 				} else {
-/*
-TODO:
-cannot copy 2ws to replica because it could not be the same type of processor: //extrai o path para a aplicação
-gera o ficheiro config para o servidor
-*/
-					// Send Config File to Replica
-					ExecOsCmd("/usr/bin/rsync", cAppName+".hcl", vConfCon.ReplicaConnection)
+					// Send DIL to Replica
+					LogToFile(vConfigDef, fmt.Sprintf("    Sending DIL to Remote Replica"))
+					ExecOsCmd("/usr/bin/rsync", vConfConSync._DILFilePath, vConfCon._ReplicaUserHost+":"+vConfConSync._DILReplicaFilePath)
 					// Create IAR on Replica
-					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o IAR", vConfCon._ReplicaAppFilePath, vConfCon.ReplicaConnection))
-					// Create DIR on Replica
-					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o DIR", vConfCon._ReplicaAppFilePath, vConfCon.ReplicaConnection))
-					// Get created DIR from Host to Local
-					ExecOsCmd("/usr/bin/rsync", vConfCon._ReplicaUserHost+":"+vConfConSync._DIRReplicaFilePath, vConfConSync._DIRFilePath)
-					// Analyse Differences
-					DiffDILandDIR(vConfConSync)
-					// Send CAR.sh to Replica
-					ExecOsCmd("/usr/bin/rsync", vConfConSync._CARFilePath, vConfCon._ReplicaUserHost+":"+vConfConSync._CARReplicaFilePath)
-					// Exec remote CAR.sh
-					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("/bin/sh %s", vConfConSync._CARReplicaFilePath))
+					LogToFile(vConfigDef, fmt.Sprintf("    Making IAR Remotly"))
+					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o Replica", vConfCon._ReplicaAppFilePath, vConfConSync._Id)) //vConfCon.ReplicaConnection))
+					// Receive CAL.sh, RSR.txt, RSL.txt from Replica
+					LogToFile(vConfigDef, fmt.Sprintf("    Receiving CAL from Remote Replica"))
+					ExecOsCmd("/usr/bin/rsync", vConfCon._ReplicaUserHost+":"+vConfConSync._CALReplicaFilePath, vConfConSync._CALFilePath)
+					// Receive CAL.sh, RSR.txt, RSL.txt from Replica
+					LogToFile(vConfigDef, fmt.Sprintf("    Receiving RSR from Remote Replica"))
+					ExecOsCmd("/usr/bin/rsync", vConfCon._ReplicaUserHost+":"+vConfConSync._RSRReplicaFilePath, vConfConSync._RSRFilePath)
+					// Receive CAL.sh, RSR.txt, RSL.txt from Replica
+					LogToFile(vConfigDef, fmt.Sprintf("    Receiving RSL from Remote Replica"))
+					ExecOsCmd("/usr/bin/rsync", vConfCon._ReplicaUserHost+":"+vConfConSync._RSLReplicaFilePath, vConfConSync._RSLFilePath)
 					// Exec CAL.sh (Before sending files to Replica because renaming file in conflict)
+					LogToFile(vConfigDef, fmt.Sprintf("    Executing CAL"))
 					ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
 					// Send files to Replica
+					LogToFile(vConfigDef, fmt.Sprintf("    Sending Files to Remote Replica"))
 					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSLFilePath), "-R",
 						vConfConSync.LocalRoot, vConfCon._ReplicaUserHost+":"+vConfConSync.ReplicaRoot)
 					// Create IUR on Host
-					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o IUR", vConfCon._ReplicaAppFilePath, vConfCon.ReplicaConnection))
+					LogToFile(vConfigDef, fmt.Sprintf("    Making IUR Remotly"))
+					ExecOsCmd("/usr/bin/ssh",   vConfCon._ReplicaUserHost, fmt.Sprintf("%s -r %s -o IUR", vConfCon._ReplicaAppFilePath, vConfConSync._Id)) //vConfCon.ReplicaConnection))
 					// Receive files from Replica
+					LogToFile(vConfigDef, fmt.Sprintf("    Receiving Files from Remote Replica"))
 					ExecOsCmd("/usr/bin/rsync", fmt.Sprintf("--files-from=%s", vConfConSync._RSRFilePath), "-R",
 						vConfCon._ReplicaUserHost+":"+vConfConSync.ReplicaRoot, vConfConSync.LocalRoot)
-					// Create IUL
-					criaIUL(vConfConSync)
-				}
-			}//for
-		}//if vConfCon.ReplicaConnection == iReplicaConnectionToSync
+				}//if (vConfCon.ReplicaConnection == "") {
+				// Create IUL
+				LogToFile(vConfigDef, fmt.Sprintf("    Making IUL"))
+				criaIUL(vConfConSync)
+			}//if vConfCon.ReplicaConnection == iReplicaConnectionToSync
+		}//for
 	}//for
+	LogToFile(vConfigDef, fmt.Sprintf("Ending"))
 }
 
 
 func main() {
 	var vOp, vConfigFilePath, vReplicaConnectionToSync string
-    flag.StringVar(&vOp, "o", "", "Options available: IAL, DIL, IAR, DIR, DIF, IUL, IUR")
+    flag.StringVar(&vOp, "o", "", "Options available: Replica, IUR")
     flag.StringVar(&vConfigFilePath, "c", "", "Config file path")
     flag.StringVar(&vReplicaConnectionToSync, "r", "", "Replica connection to sync")
 
 	flag.Parse()
-	
+
 	if vOp == "" {
 		twows(vConfigFilePath, vReplicaConnectionToSync)
 	} else {
 		vConfigDef := readConfig(vConfigFilePath)
+		LogToFile(vConfigDef, "Starting with -o " + vOp)
 		for _, vConfCon := range vConfigDef.ConnectionsList {
-			if (vReplicaConnectionToSync == "") || (vConfCon.ReplicaConnection == vReplicaConnectionToSync) {
-				for _, vConfConSync := range vConfCon.SyncsList {
+			LogToFile(vConfigDef, fmt.Sprintf("Processing Connection %s", vConfCon.ReplicaConnection))
+			for _, vConfConSync := range vConfCon.SyncsList {
+				if (vReplicaConnectionToSync == "") || (vConfConSync._Id == vReplicaConnectionToSync) {
 					switch vOp{
-					case "IAL": criaIAL(vConfConSync)
-					case "DIL":
-						criaNovoSeNaoExisteIUL(vConfConSync)
-						fazDIL(vConfConSync)
-					case "IAR": criaIAR(vConfConSync)
-					case "DIR":
+					case "Replica":
+						LogToFile(vConfigDef, fmt.Sprintf("    Making IAR"))
+						criaIAR(vConfConSync)
+						LogToFile(vConfigDef, fmt.Sprintf("    Making DIR"))
 						criaNovoSeNaoExisteIUR(vConfConSync)
 						fazDIR(vConfConSync)
-					case "DIF": DiffDILandDIR(vConfConSync)
-					case "CAR": ExecOsCmd("/bin/sh", vConfConSync._CARFilePath)
-					case "CAL": ExecOsCmd("/bin/sh", vConfConSync._CALFilePath)
-					case "IUL": criaIUL(vConfConSync)
-					case "IUR": criaIUR(vConfConSync)
+						LogToFile(vConfigDef, fmt.Sprintf("    Making diffs"))
+						DiffDILandDIR(vConfConSync)
+						LogToFile(vConfigDef, fmt.Sprintf("    Executing CAR"))
+						ExecOsCmd("/bin/sh", vConfConSync._CARFilePath)
+					case "IUR":
+						LogToFile(vConfigDef, fmt.Sprintf("    Making IUR"))
+						criaIUR(vConfConSync)
 					}//switch
-				}//for
-			}//if vConfCon.ReplicaConnection == vReplicaConnectionToSync
+				}//if vConfCon.ReplicaConnection == vReplicaConnectionToSync	
+			}//for
 		}//for
+		LogToFile(vConfigDef, fmt.Sprintf("Ending"))	
 	}
 }
